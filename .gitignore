@@ -1,0 +1,6 @@
+haskell/cabal-dev
+haskell/dist
+haskell/Setup.hs
+perl/cached_images
+haskell/cached_images
+*.svn
