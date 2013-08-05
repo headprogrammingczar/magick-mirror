@@ -47,31 +47,45 @@ data ImageState = ImageState {filename :: String, workingdir :: String} deriving
 -- A Magick transformation is two separate computations - the inner computation is an image transformation, which will be entirely imagemagick work
 -- The outer computation manipulates the start and end file locations for the inner computation, as well as manipulating the computation itself
 type Magick a = State Transform a
-type Transform = (ImageState, Image -> IO Image)
-
--- generic version of Magick
-type CompileT s r c m a = StateT (s, r -> c r) m a
+type Transform = (ImageState, IO Image)
 
 -- instead of taking a base file like runMagick, take a blank canvas of the given dimensions and use it as a base
-runCanvas :: Int -> Int -> FilePath -> Magick () -> IO (Image, ImageState)
+runCanvas :: Int -> Int -> FilePath -> Magick () -> IO ImageState
 runCanvas x y workingdir transform = do
+  direxists <- doesDirectoryExist workingdir
+  when (not direxists) $ do
+    createDirectory workingdir
   let filename = workingdir </> "canvas-"++(show x)++"x"++(show y)++".png"
-  rawConvert (BSC.pack "") ["-size", (show x) ++ "x" ++ (show y), "canvas:", "-alpha", "transparent", workingdir </> "canvas-"++(show x)++"x"++(show y)++".png"]
+  exists <- doesFileExist filename
+  case exists of
+    True -> return ()
+    False -> do
+      rawConvert (BSC.pack "") ["-size", (show x) ++ "x" ++ (show y), "canvas:", "-alpha", "transparent", filename]
+      return ()
   runMagick filename workingdir transform
 
 -- given a reference file and working dir, read the image in, then prepare a working directory
 -- build a transformation, then execute the transformation, returning the results of both the prep and the transform
-runMagick :: FilePath -> FilePath -> Magick () -> IO (Image, ImageState)
+runMagick :: FilePath -> FilePath -> Magick () -> IO ImageState
 runMagick file workingdir transform = do
-  (i, initialState) <- prepFile file workingdir
-  let (a, (finalState, f)) = runState (transform >> autoCheckpoint) (initialState, return)
-  finalImage <- f i
-  return (finalImage, finalState)
+  -- prepare initial file state, and make sure directories we need all exist
+  initialState <- prepFile file workingdir
+  -- compute final image location
+  let (a, (finalState, compute)) = runState (transform >> autoCheckpoint) (initialState, readImage file)
+  -- generate final image
+  exists <- checkFile finalState
+  case exists of
+    True -> return ()
+    False -> do
+      compute
+      return ()
+  -- return final image state
+  return finalState
 
 runRawMagick :: FilePath -> FilePath -> Magick () -> Transform
 runRawMagick file workingdir transform =
   let initialState = prepFilename file workingdir
-      (a, resultTrans) = runState (transform >> autoCheckpoint) (initialState, return)
+      (a, resultTrans) = runState (transform >> autoCheckpoint) (initialState, readImage file)
    in resultTrans
 
 readImage :: FilePath -> IO Image
@@ -79,12 +93,12 @@ readImage path = BS.readFile path
 
 checkFile :: ImageState -> IO Bool
 checkFile s = do
-  let path = workingdir s </> filename s
+  let path = imagePath s
   doesFileExist path
 
 writeToFile :: ImageState -> Image -> IO ()
 writeToFile s i = do
-  let path = workingdir s </> filename s
+  let path = imagePath s
   BS.writeFile path i
 
 prepFilename :: FilePath -> FilePath -> ImageState
@@ -92,28 +106,27 @@ prepFilename file workingdir = let (_, filename) = splitFileName file in ImageSt
 
 prepFileContents :: FilePath -> FilePath -> IO Image
 prepFileContents file workingdir = do
+  readImage file
+
+prepFile :: FilePath -> FilePath -> IO ImageState
+prepFile file workingdir = do
   direxists <- doesDirectoryExist workingdir
   when (not direxists) $ do
     createDirectory workingdir
-  readImage file
-
-prepFile :: FilePath -> FilePath -> IO (Image, ImageState)
-prepFile file workingdir = do
-  i <- prepFileContents file workingdir
   let initialState = (prepFilename file workingdir)
-  return (i, initialState)
+  return initialState
 
 autoCheckpoint :: Magick ()
 autoCheckpoint = do
   (s, f) <- get
-  let path = workingdir s </> filename s
-  let f' i = do exists <- checkFile s
-                case exists of
-                  True -> readImage path
-                  False -> do
-                    i' <- f i
-                    writeToFile s i'
-                    return i'
+  let path = imagePath s
+  let f' = do exists <- checkFile s
+              case exists of
+                True -> readImage path
+                False -> do
+                  i' <- f
+                  writeToFile s i'
+                  return i'
   put (s, f')
 
 checkpoint :: String -> Magick ()
@@ -122,13 +135,6 @@ checkpoint path = do
   let s' = s {filename = path}
   put (s', f)
   autoCheckpoint
-
-prepend prefix s = s {filename = prefix ++ filename s}
-
-mergeStates s s' = s {filename = prefix ++ filename s}
-  where
-    prefix = hash ++ "-"
-    hash = showDigest . sha1 . BSL.pack $ (workingdir s' </> filename s')
 
 -- just execute "convert"
 rawConvert :: ByteString -> [String] -> IO ByteString
@@ -156,30 +162,15 @@ rawIdentify input args = do
 rawTransform :: [String] -> Image -> IO Image
 rawTransform args input = rawConvert input (["-"] ++ args ++ ["-"])
 
-liftTransform :: String -> (Image -> IO Image) -> Magick ()
-liftTransform prefix f = do
-  (s, f') <- get
-  let s' = prepend (prefix ++ "-") s
-  let f'' i = do i' <- f' i
-                 f i'
-  put (s', f'')
-
 transform :: String -> [String] -> Magick ()
 transform prefix args = do
   (s, f) <- get
   let s' = prepend (prefix ++ "-") s
-  let f' i = do i' <- f i
-                rawTransform args i'
+  let f' = do i' <- f
+              rawTransform args i'
   put (s', f')
 
-imagePath :: ImageState -> FilePath
-imagePath s = (workingdir s </> filename s)
-
-showGeometry :: Int -> Int -> Int -> Int -> String
-showGeometry w h x y = (show w) ++ "x" ++ (show h) ++ (plus x) ++ (plus y)
-  where
-    plus n | n >= 0 = '+' : show n
-           | otherwise = show n
+prepend prefix s = s {filename = prefix ++ filename s}
 
 -- run a layered computation within the current one, returning the path of the file it will produce
 runLayer :: FilePath -> Magick () -> Magick FilePath
@@ -187,18 +178,32 @@ runLayer image trans = do
   (s, f) <- get
   let (sl, fl) = runRawMagick image (workingdir s) trans
   let s' = mergeStates s sl
-  let f' i = do i' <- f i
-                li <- prepFileContents image (workingdir sl)
-                li' <- fl li -- infuriatingly, we can't use li' for anything - we are mainly interested in the "writing an image file" side-effect
-                return i'
+  let f' = do i' <- f
+              li <- prepFileContents image (workingdir sl)
+              li' <- fl -- infuriatingly, we can't use li' for anything - we are mainly interested in the "writing an image file" side-effect
+              return i'
   put (s', f')
-  return (workingdir sl </> filename sl)
+  return $ imagePath sl
+
+mergeStates s s' = s {filename = prefix ++ filename s}
+  where
+    prefix = hash ++ "-"
+    hash = showDigest . sha1 . BSL.pack $ imagePath s'
+
+imagePath :: ImageState -> FilePath
+imagePath s = (workingdir s </> filename s)
 
 runClone :: Magick () -> Magick FilePath
 runClone trans = do
   autoCheckpoint
   (s, f) <- get
-  runLayer (workingdir s </> filename s) trans
+  runLayer (imagePath s) trans
+
+showGeometry :: Int -> Int -> Int -> Int -> String
+showGeometry w h x y = (show w) ++ "x" ++ (show h) ++ (plus x) ++ (plus y)
+  where
+    plus n | n >= 0 = '+' : show n
+           | otherwise = show n
 
 grayscale = transform "grayscale" ["-type", "GrayScaleMatte"]
 
@@ -217,8 +222,8 @@ format ext = do
   (s, f) <- get
   let path = replaceExtension (filename s) ext
   let s' = s {filename = path}
-  let f' i = do i' <- f i
-                rawConvert i' ["-", ext ++ ":-"]
+  let f' = do i' <- f
+              rawConvert i' ["-", ext ++ ":-"]
   put (s', f')
 
 resize :: String -> Magick ()
@@ -239,8 +244,8 @@ merge image = do
 mergeUnder image = do
   (s, f) <- get
   let s' = prepend ("mergeUnder-") s
-  let f' i = do i' <- f i
-                rawConvert i' [image, "-", "-background", "none", "-layers", "merge", "-"]
+  let f' = do i' <- f
+              rawConvert i' [image, "-", "-background", "none", "-layers", "merge", "-"]
   put (s', f')
 
 blend i m = do
@@ -276,6 +281,10 @@ autoOrient = do
 
 translate dx dy = do
   transform ("translate_" ++ (show dx) ++ "_" ++ (show dy)) ["-distort", "Affine", "0,0 " ++ (show dx) ++ "," ++ (show dy)]
+
+shape color fill s = do
+  let hash = showDigest . sha1 . BSL.pack $ s
+  transform ("shape_"++color++"_"++fill++"_"++hash) ["-fill", fill, "-stroke", color, "-draw", s]
 
 getExif :: FilePath -> IO Exif
 getExif filename = do

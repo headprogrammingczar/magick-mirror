@@ -28,6 +28,10 @@ main = do
   testAdjusts
   putStrLn "blank canvas"
   testBlankCanvas
+  putStrLn "lots"
+  testLots
+  putStrLn "shapes"
+  testShapes
   return ()
 
 -- shows atlantis, fading into saturn
@@ -100,4 +104,15 @@ testAdjusts = do
 testBlankCanvas = do
   runCanvas 300 150 "cached_images" $ do
     return ()
+
+testLots = forM_ [1..5000] $ \i -> do
+  runCanvas 40 40 "cached_images" $ do
+    format "png"
+    forM_ [1..50] $ \j -> do
+      composite "images/AtlantisReflection_ingalls.jpg"
+    checkpoint "lots-test.png"
+
+testShapes = do
+  runCanvas 300 150 "cached_images" $ do
+    shape "black" "green" "arc  20,10 80,50 45,270"
 
