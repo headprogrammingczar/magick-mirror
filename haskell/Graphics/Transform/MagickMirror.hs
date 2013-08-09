@@ -158,6 +158,8 @@ rawIdentify input args = do
     _ -> BSC.putStrLn err >> exitFailure
   return (BSC.unpack out)
 
+decompress img = rawConvert BSC.empty [img, "-compress", "none", img]
+
 -- pass the necessary parameters to "convert" such that it behaves as a transformation from Image to Image
 rawTransform :: [String] -> Image -> IO Image
 rawTransform args input = rawConvert input (["-"] ++ args ++ ["-"])
@@ -198,6 +200,12 @@ runClone trans = do
   autoCheckpoint
   (s, f) <- get
   runLayer (imagePath s) trans
+
+showDrawGeometry :: [(Int, Int)] -> String
+showDrawGeometry = Data.List.unwords . showDrawGeometry'
+  where
+    showDrawGeometry' [] = []
+    showDrawGeometry' (p:ps) = (show (fst p)++","++show (snd p)) : showDrawGeometry' ps
 
 showGeometry :: Int -> Int -> Int -> Int -> String
 showGeometry w h x y = (show w) ++ "x" ++ (show h) ++ (plus x) ++ (plus y)
@@ -254,6 +262,10 @@ blend i m = do
 
 makeUV r g = runLayer r $ do
   transform "uv" [g, "-background", "black", "-channel", "RG", "-combine"]
+
+displace :: FilePath -> Int -> String -> Magick ()
+displace m magnitude outsideColor = do
+  transform "displace" ["-matte", m, "-virtual-pixel", outsideColor, "-fx", "p{dy="++show magnitude++"*(2v.r-1);dx="++show magnitude++"*(2v.g-1);dx*w,dy*h}"]
 
 shadow color geometry = do
   s <- runClone $ do
